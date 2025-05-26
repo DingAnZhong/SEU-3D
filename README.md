@@ -1,2 +1,2 @@
-# sc3d-for-XieLab
+# SEU-3D
 基于napari的空间转录组可视化插件，也包括一些分析方法
