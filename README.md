@@ -5,7 +5,7 @@
 在终端中
 ### 创建环境
 ```python
-conda env create -f environment.yml
+conda env create -f env.yml
 ```
 ### 安装包
 ```python
