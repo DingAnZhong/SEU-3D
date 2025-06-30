@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seu-3d"
-version = "1.0.5"
+version = "1.0.15"
 authors = [
   { name="XieLab", email="220242543@seu.edu.cn" },
 ]
