@@ -17,8 +17,8 @@ pip install --upgrade seu-3d
 napari
 ```
 #### 打开文件目录选择h5ad文件
-![fcc1f64b-b66e-4580-9276-63e066ebb61a](https://github.com/user-attachments/assets/4c9f3c27-ee4d-4a0d-9d4c-27af4a3a372b)
+![image](https://github.com/user-attachments/assets/47d8d99f-e2c7-41e1-be29-6671beef2d8d)
 #### 加载文件可看到组件，在下拉框中选择展示的组织或细胞类型，以及空间坐标
-![026b89c7-913e-4409-8d36-eb30af9baec3](https://github.com/user-attachments/assets/f2d51fb7-6f09-4cc5-acd5-b597f0c10fb3)
+![image](https://github.com/user-attachments/assets/4f94de15-365a-44a8-b796-a33ec60b950b)
 #### 结果示例
 ![64ba8e66-9666-4ce1-9cac-01a49f5a549a](https://github.com/user-attachments/assets/0c6432a4-b6a1-4736-a0fb-4c4e0b8d498e)
