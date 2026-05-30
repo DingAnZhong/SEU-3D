@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive files (never commit)
+*token*.txt
+*-Recovery-Codes-*.txt
+environment.yml
+
+# Data files
+*.h5ad
+data/
+*.csv
+*.txt
+
+# Test results
+test/test_results.txt
+test/test_end2end_results.txt
+
+# conda pack output
+conda_packages.txt

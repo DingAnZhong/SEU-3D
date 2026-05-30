@@ -1,0 +1,10 @@
+name: seu-3d
+display_name: seu-3d
+contributions:
+  commands:
+    - id: seu-3d.load_atlas
+      python_name: seu_3d.load:ReadAdata
+      title: Make seu-3d Viewer Widget
+  widgets: 
+    - command: seu-3d.load_atlas
+      display_name: Load spatial transcriptomics data
