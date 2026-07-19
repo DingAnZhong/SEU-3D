@@ -4,37 +4,24 @@ from qtpy import QtCore, QtWidgets
 QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
 from qtpy.QtWidgets import QTabWidget, QVBoxLayout, QWidget
 from magicgui import widgets
-from ._umap_selection import UmapSelection
-from ._utils import error_points_selection, safe_toarray
-from napari.utils.colormaps import ALL_COLORMAPS, Colormap
+from ._utils import error_points_selection, safe_toarray, col_mean
+from napari.qt.threading import thread_worker
 from matplotlib import pyplot as plt
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
 )
-from matplotlib.backends.backend_qt5agg import (
-    NavigationToolbar2QT as NavigationToolbar,
-)
-from matplotlib import cm, colors
+import matplotlib.colors as mcolors
 import numpy as np
 import logging
-import numpy as np
-import pandas as pd
-from scipy.cluster import hierarchy as sch
-import random
-from sklearn.metrics.pairwise import cosine_similarity
-from matplotlib import pyplot as plt
-import matplotlib.colors as mcolors
 import colorcet as cc
-import scanpy as sc
 import squidpy as sq
-from tqdm import tqdm
-import sys
-from scipy.sparse import issparse
+from scipy.spatial import cKDTree
+from sklearn.metrics.pairwise import cosine_similarity
 try:
     from pyvista import PolyData
 
     pyvista = True
-except Exception as e:
+except Exception:
     print(
         (
             "pyvista is not installed. No surfaces can be generated\n"
@@ -42,6 +29,49 @@ except Exception as e:
         )
     )
     pyvista = False
+
+
+@thread_worker
+def _compute_surface_worker(adata, tissue_name, surf_tissue, coord_key):
+    """
+    Subset `adata` to `surf_tissue` and compute a Delaunay surface.
+    Returns (vertices, faces). Runs in a worker thread.
+    """
+    adata_surf = adata[adata.obs[tissue_name].isin(surf_tissue)]
+    points = adata_surf.obsm[coord_key]
+    mesh = PolyData(points).delaunay_3d().extract_surface()
+    raw = mesh.faces.copy()
+    if raw.size % 4 == 0 and (raw[::4] == 3).all():
+        # Fast path: all-triangle mesh
+        faces = raw.reshape(-1, 4)[:, 1:]
+    else:
+        face_list = list(raw)
+        faces = []
+        while face_list:
+            nb_p = face_list.pop(0)
+            faces.append([face_list.pop(0) for _ in range(nb_p)])
+        faces = np.array(faces)
+    return mesh.points, faces
+
+
+@thread_worker
+def _moran_worker(adata, coord_key):
+    """Compute Moran's I spatial autocorrelation in a worker thread."""
+    sq.gr.spatial_neighbors(adata, spatial_key=coord_key, key_added='spatial')
+    return sq.gr.spatial_autocorr(adata, mode="moran", copy=True)
+
+
+@thread_worker
+def _similar_genes_worker(adata, gene):
+    """
+    Cosine similarity of `gene` against every gene, sparse-aware
+    (sklearn handles sparse input without densifying the matrix).
+    Returns the 10 most similar gene names, excluding `gene` itself.
+    """
+    sim = cosine_similarity(adata.X.T, adata[:, gene].X).ravel()
+    order = np.argsort(sim)[::-1]
+    return [adata.var_names[i] for i in order if adata.var_names[i] != gene][:10]
+
 
 class DisplayEmbryo():
     '''
@@ -55,6 +85,50 @@ class DisplayEmbryo():
         colors_hex = [mcolors.rgb2hex(color) for color in discrete_cmap.colors]
         return colors_hex
     
+    @staticmethod
+    def _normalize_exp(gene_exp):
+        """
+        Min-max normalize a gene expression vector to [0, 1].
+        Returns zeros when the gene has constant expression (max == min).
+        """
+        gene_exp = np.asarray(gene_exp, dtype=float)
+        min_e, max_e = gene_exp.min(), gene_exp.max()
+        if max_e == min_e:
+            return np.zeros_like(gene_exp)
+        return np.clip((gene_exp - min_e) / (max_e - min_e), 0, 1)
+
+    def _show_gene_expression(self, adata, gene):
+        """
+        Add a points layer coloured by the expression of `gene`
+        and cache the per-cell colours for show_flatten().
+        """
+        gene_exp = safe_toarray(adata[:, gene].X)[:, 0]
+        gene_exp_norm = self._normalize_exp(gene_exp)
+        colors = cc.cm["CET_L4"](gene_exp_norm / 2)
+        self.viewer.add_points(
+            adata.obsm[self.embryo.coordinate_3d_key],
+            size=10,
+            face_color=colors,
+            features={'gene_exp': gene_exp},
+            name=f'gene_{gene}',
+        )
+        self.cell_gene_color = {
+            i: color for i, color in zip(range(len(gene_exp)), colors)
+        }
+    
+    def _on_worker_error(self, *args):
+        self.viewer.status = "Computation failed (see console)."
+
+    def _on_surface_ready(self, result, surf_tissue):
+        vertices, faces = result
+        self.viewer.status = "Surface ready."
+        self.viewer.add_surface(
+            (vertices, faces),
+            colormap=self.tissue_color_map[surf_tissue[0]],
+            opacity=0.5,
+            name='surface_' + surf_tissue[0],
+        )
+    
     def legend_tab(self):
         '''
         Create the legend tab
@@ -63,9 +137,6 @@ class DisplayEmbryo():
             fig, ax = plt.subplots()
             ax.axis('off')
             colors_hex = self.color_set()
-            idx = list(range(len(colors_hex)))
-            random.shuffle(idx)
-            colors_hex = [colors_hex[i] for i in idx]
             for color,tissue in zip(colors_hex,self.embryo.all_tissues):
                 ax.plot([], [], 's', markersize=7, color=color, label=tissue)
             canvas = FigureCanvas(fig)
@@ -92,7 +163,10 @@ class DisplayEmbryo():
         points = self.viewer.layers.selection.active
         if points is None or points.as_layer_data_tuple()[-1] != "points":
             error_points_selection()
-        adata = self.embryo.adata.copy()
+            return
+        # Boolean indexing below already returns a copy; no need to copy the
+        # full AnnData up front.
+        adata = self.embryo.adata
 
         selected_tissue = self.tissue_select.value
         selected_slice = self.slice_select.value
@@ -102,8 +176,9 @@ class DisplayEmbryo():
         
         filter_1 = adata[adata.obs[self.embryo.tissue_name].isin(selected_tissue)]
 
-        if 'slice' in adata.obs.columns:
-            filter_2 = filter_1[filter_1.obs['slice'].isin(selected_slice)]
+        # Keep in sync with slice_tab(): the selector is built from 'slices'
+        if 'slices' in adata.obs.columns:
+            filter_2 = filter_1[filter_1.obs['slices'].isin(selected_slice)]
         elif 'orig.ident' in adata.obs.columns:
             filter_2 = filter_1[filter_1.obs['orig.ident'].isin(selected_slice)]
         else:
@@ -161,9 +236,12 @@ class DisplayEmbryo():
             )
             return
         else:
-            x_flatten = adata.obs['y_flatten'].values
-            y_flatten = adata.obs['x_flatten'].values
-            xy_flatten = np.column_stack((x_flatten, y_flatten))
+            # napari displays points as (row, col), i.e. (y, x)
+            y_flatten = adata.obs['y_flatten'].values
+            x_flatten = adata.obs['x_flatten'].values
+            xy_flatten = np.column_stack((y_flatten, x_flatten))
+            if 'flatten' in self.viewer.layers:
+                self.viewer.layers.remove('flatten')
             if hasattr(self, 'cell_gene_color'):
                 self.viewer.add_points(
                     xy_flatten,
@@ -275,12 +353,14 @@ class DisplayEmbryo():
                 [0, 3, 7], [0, 7, 4],
                 [1, 2, 6], [1, 6, 5]
             ])
+            if 'preview_box' in self.viewer.layers:
+                self.viewer.layers.remove('preview_box')
             self.viewer.add_surface(
                 (vertices, faces),
                 colormap='gray',
                 opacity=0.5,
                 shading='flat',
-                name = 'preview_box',
+                name='preview_box',
             )
         def select_xy():
             self.show_x_min = widgets.FloatSpinBox(
@@ -327,30 +407,18 @@ class DisplayEmbryo():
     def surface_tab(self):
         def show_surf():
             surf_tissue = self.surf_tissue.value
-            adata = self.embryo.adata.copy()
-            adata_surf = adata[adata.obs[self.embryo.tissue_name].isin(surf_tissue)]
-            points = adata_surf.obsm[self.embryo.coordinate_3d_key]
-            pd = PolyData(points)
-            mesh = pd.delaunay_3d().extract_surface()
-            face_list = list(mesh.faces.copy())
-            face_sizes = {}
-            faces = []
-            while 0 < len(face_list):
-                nb_P = face_list.pop(0)
-                if not nb_P in face_sizes:
-                    face_sizes[nb_P] = 0
-                face_sizes[nb_P] += 1
-                curr_face = []
-                for _ in range(nb_P):
-                    curr_face.append(face_list.pop(0))
-                faces.append(curr_face)
-            faces = np.array(faces)
-            self.viewer.add_surface(
-                (mesh.points, faces),
-                colormap=self.tissue_color_map[surf_tissue[0]],
-                opacity=0.5,
-                name = 'surface_' + surf_tissue[0],
+            self.viewer.status = "Computing surface..."
+            worker = _compute_surface_worker(
+                self.embryo.adata,
+                self.embryo.tissue_name,
+                surf_tissue,
+                self.embryo.coordinate_3d_key,
             )
+            worker.returned.connect(
+                lambda result: self._on_surface_ready(result, surf_tissue)
+            )
+            worker.errored.connect(self._on_worker_error)
+            worker.start()
         def select_surf():
             if pyvista:
                 surf_label = widgets.Label(value="Choose tissue")
@@ -387,12 +455,26 @@ class DisplayEmbryo():
     def annotate_tab(self):
         def annotate():
             points = self.viewer.layers.selection.active
+            if points is None or points.as_layer_data_tuple()[-1] != "points":
+                error_points_selection()
+                return
             selected_id = list(points.selected_data)
-            selected_points = points.data[selected_id]
-        
+            if not selected_id:
+                logging.warning("No points selected; nothing to annotate.")
+                return
+            selected_points = np.atleast_2d(
+                np.asarray(points.data[selected_id], dtype=float)
+            )
+
             adata = self.embryo.adata.copy()
-            selected_points = np.array(selected_points)
-            mask = np.isin(adata.obsm[self.embryo.coordinate_3d_key], selected_points).all(axis=1)
+            coords = np.asarray(
+                adata.obsm[self.embryo.coordinate_3d_key], dtype=float
+            )
+            # Match selected points back to cells by nearest-neighbour
+            # distance instead of exact float equality.
+            dist, idx = cKDTree(coords).query(selected_points)
+            mask = np.zeros(coords.shape[0], dtype=bool)
+            mask[np.unique(idx[dist <= 1e-6])] = True
 
             if column_name.value not in adata.obs.columns:
                 adata.obs[column_name.value] = adata.obs[self.embryo.tissue_name].copy()
@@ -411,6 +493,12 @@ class DisplayEmbryo():
             print(adata.obs[column_name.value].value_counts())
 
         def save_annotations():
+            if not hasattr(self.embryo, 'adata_anno'):
+                logging.warning(
+                    "No annotations to save yet - "
+                    "run 'Annotation to selected points' first."
+                )
+                return
             path = save_path.value
             self.embryo.adata_anno.obs[column_name.value] = self.embryo.adata_anno.obs[column_name.value].cat.remove_unused_categories()
             self.embryo.adata_anno.write_h5ad(path)
@@ -453,34 +541,20 @@ class DisplayEmbryo():
             else:
                 self.gene.value = select_gene
                 gene = select_gene
-            gene_exp = safe_toarray(adata[:, gene].X)[:,0]
-            min_exp, max_exp = gene_exp.min(), gene_exp.max()
-            gene_exp_norm = (gene_exp - min_exp) / (max_exp - min_exp)
-            features = {}
-            features['gene_exp'] = gene_exp
-            viewer.add_points(
-                adata.obsm[self.embryo.coordinate_3d_key],
-                size=10,
-                face_color = cc.cm["CET_L4"](gene_exp_norm / 2),
-                features= features,
-                name=f'gene_{gene}',
-            )
-            self.cell_gene_color = {
-                i: color
-                for i, color in zip(list(range(len(gene_exp))), cc.cm["CET_L4"](gene_exp_norm / 2))
-            }
+            self._show_gene_expression(adata, gene)
 
         def show_similar_genes():
-            all_gene_exp = safe_toarray(adata.X).T
-            gene_exp = safe_toarray(adata[:, self.gene.value].X)[:,0]
-            similarity_list = cosine_similarity(all_gene_exp, gene_exp.reshape(1, -1)).flatten()
-            similarity_dict = {
-                adata.var_names[i]: similarity_list[i]
-                for i in range(len(adata.var_names))
-            }
-            sorted_genes = sorted(similarity_dict.items(), key=lambda x: x[1], reverse=True)
-            self.similar_genes = [gene for gene, _ in sorted_genes if gene != self.gene.value][:10]
-            self.select_gene.choices = self.similar_genes
+            gene = self.gene.value
+            self.viewer.status = f"Computing genes similar to {gene}..."
+            worker = _similar_genes_worker(adata, gene)
+            worker.returned.connect(on_similar_ready)
+            worker.errored.connect(self._on_worker_error)
+            worker.start()
+
+        def on_similar_ready(similar):
+            self.similar_genes = similar
+            self.select_gene.choices = similar
+            self.viewer.status = "Similar genes ready."
         
         def container():
             """
@@ -548,11 +622,8 @@ class DisplayEmbryo():
             gene_2 = self.gene_2.value
             gene_exp_1 = safe_toarray(self.selected_adata[:, gene_1].X)[:,0]
             gene_exp_2 = safe_toarray(self.selected_adata[:, gene_2].X)[:,0]
-            min_exp_1, max_exp_1 = gene_exp_1.min(), gene_exp_1.max()
-            min_exp_2, max_exp_2 = gene_exp_2.min(), gene_exp_2.max()
-            with np.errstate(divide='ignore', invalid='ignore'):
-                gene_exp_norm_1 = np.clip((gene_exp_1 - min_exp_1) / (max_exp_1 - min_exp_1), 0, 1)
-                gene_exp_norm_2 = np.clip((gene_exp_2 - min_exp_2) / (max_exp_2 - min_exp_2), 0, 1)
+            gene_exp_norm_1 = self._normalize_exp(gene_exp_1)
+            gene_exp_norm_2 = self._normalize_exp(gene_exp_2)
             colors = np.zeros((len(gene_exp_norm_1), 3))
             colors[:, 0] = gene_exp_norm_1
             colors[:, 1] = gene_exp_norm_2
@@ -623,13 +694,9 @@ class DisplayEmbryo():
             gene_exp_1 = safe_toarray(adata[:, gene_1].X)[:,0]
             gene_exp_2 = safe_toarray(adata[:, gene_2].X)[:,0]
             gene_exp_3 = safe_toarray(adata[:, gene_3].X)[:,0]
-            min_exp_1, max_exp_1 = gene_exp_1.min(), gene_exp_1.max()
-            min_exp_2, max_exp_2 = gene_exp_2.min(), gene_exp_2.max()
-            min_exp_3, max_exp_3 = gene_exp_3.min(), gene_exp_3.max()
-            with np.errstate(divide='ignore', invalid='ignore'):
-                gene_exp_norm_1 = np.clip((gene_exp_1 - min_exp_1) / (max_exp_1 - min_exp_1), 0, 1)
-                gene_exp_norm_2 = np.clip((gene_exp_2 - min_exp_2) / (max_exp_2 - min_exp_2), 0, 1)
-                gene_exp_norm_3 = np.clip((gene_exp_3 - min_exp_3) / (max_exp_3 - min_exp_3), 0, 1)
+            gene_exp_norm_1 = self._normalize_exp(gene_exp_1)
+            gene_exp_norm_2 = self._normalize_exp(gene_exp_2)
+            gene_exp_norm_3 = self._normalize_exp(gene_exp_3)
             colors = np.zeros((len(gene_exp_norm_1), 3))
             colors[:, 0] = gene_exp_norm_1
             colors[:, 1] = gene_exp_norm_2
@@ -693,65 +760,6 @@ class DisplayEmbryo():
         three_genes_tab.addTab(container().native, 'Select Three Genes')
         return three_genes_tab
     
-    def umap_tab(self):
-        """
-        Function that builds the qt container for the umap
-        """
-        gene_label = widgets.Label(value="Choose gene")
-        gene = widgets.LineEdit(value=self.select_gene.value)
-
-        tissues_label = widgets.Label(value="Display tissues umap")
-        tissues = widgets.CheckBox(value=False)
-
-        variable_genes_label = widgets.Label(value="Take only variable genes")
-        variable_genes = widgets.CheckBox(value=True)
-
-        stats_label = widgets.Label(value="Statistic for\nchoosing distributions")
-        stats = widgets.RadioButtons(
-            choices=["Standard Deviation", "Mean", "Median"],
-            value="Standard Deviation",
-        )
-        self.umap_selec = UmapSelection(
-            self.viewer,
-            self.embryo,
-            gene,
-            tissues,
-            stats,
-            variable_genes,
-            self.tissue_color_map,
-        )
-        umap_run = widgets.FunctionGui(
-            self.umap_selec.run, call_button="Show gene on Umap", name=""
-        )
-
-        gene_container = widgets.Container(
-            widgets=[gene_label, gene], labels=False, layout="horizontal"
-        )
-        variable_genes_container = widgets.Container(
-            widgets=[variable_genes_label, variable_genes],
-            labels=False,
-            layout="horizontal",
-        )
-        tissues_container = widgets.Container(
-            widgets=[tissues_label, tissues], labels=False, layout="horizontal"
-        )
-        stats_container = widgets.Container(
-            widgets=[stats_label, stats], labels=False, layout="horizontal"
-        )
-        umap_container = widgets.Container(
-            widgets=[
-                gene_container,
-                tissues_container,
-                variable_genes_container,
-                stats_container,
-                umap_run,
-            ],
-            labels=False,
-        )
-        umap_tab = QTabWidget()
-        umap_tab.addTab(umap_container.native, "Umap")
-        return umap_tab
-    
     def Moran_tab(self):
         """
         Function that builds the qt container for the Moran's I
@@ -759,14 +767,24 @@ class DisplayEmbryo():
         adata = self.selected_adata
         viewer = self.viewer
         def compute_moran():
-            sq.gr.spatial_neighbors(adata, spatial_key=self.embryo.coordinate_3d_key,key_added='spatial')
-            Moranres = sq.gr.spatial_autocorr(adata, mode="moran", copy = True)
-            moran_25_idx = Moranres["I"][:25].index.tolist()
-            moran_25_values = Moranres["I"][:25].values.tolist()
+            self.viewer.status = "Computing Moran's I..."
+            worker = _moran_worker(adata, self.embryo.coordinate_3d_key)
+            worker.returned.connect(on_moran_ready)
+            worker.errored.connect(self._on_worker_error)
+            worker.start()
+
+        def on_moran_ready(moran_res):
+            self.viewer.status = "Moran's I ready."
+            moran_25_idx = moran_res["I"][:25].index.tolist()
+            moran_25_values = moran_res["I"][:25].values.tolist()
             gene_exp = safe_toarray(adata[:, moran_25_idx].X)
-            gene_count_cell = np.count_nonzero(gene_exp,axis=0)
-            choice = [f"{gene} ({value})[count:{cell}]" for gene, value,cell in zip(moran_25_idx, moran_25_values,gene_count_cell)]
-            self.moran_gene.choices = choice
+            gene_count_cell = np.count_nonzero(gene_exp, axis=0)
+            self.moran_gene.choices = [
+                f"{gene} ({value})[count:{cell}]"
+                for gene, value, cell in zip(
+                    moran_25_idx, moran_25_values, gene_count_cell
+                )
+            ]
         
         def plot_moran():
             if isinstance(self.moran_gene.value, list) and len(self.moran_gene.value) > 0:
@@ -774,26 +792,11 @@ class DisplayEmbryo():
             else:
                 gene_str = self.moran_gene.value
             gene = gene_str.split(' (')[0]
-            gene_exp = safe_toarray(adata[:, gene].X)[:,0]
-            min_exp, max_exp = gene_exp.min(), gene_exp.max()
-            gene_exp_norm = (gene_exp - min_exp) / (max_exp - min_exp)
-            features = {}
-            features['gene_exp'] = gene_exp
-            viewer.add_points(
-                adata.obsm[self.embryo.coordinate_3d_key],
-                size=10,
-                face_color = cc.cm["CET_L4"](gene_exp_norm / 2),
-                features= features,
-                name=f'gene_{gene}',
-            )
-            self.cell_gene_color = {
-                i: color
-                for i, color in zip(list(range(len(gene_exp))), cc.cm["CET_L4"](gene_exp_norm / 2))
-            }
+            self._show_gene_expression(adata, gene)
         def show_moran():
             run_moran = widgets.FunctionGui(
                 compute_moran,
-                call_button="Show top 10 Moran's I",
+                call_button="Show top 25 Moran's I",
                 layout="vertical",
             )
             self.moran_gene = widgets.Select(
@@ -829,13 +832,17 @@ class DisplayEmbryo():
         viewer = self.viewer
         def compute_diff_exp():
             diff_tissue = self.diff_tissue.value
-            if diff_tissue[0] in adata.obs[self.embryo.tissue_name].unique():
-                diff_adata = adata[adata.obs[self.embryo.tissue_name] == diff_tissue[0]]
+            # Select(allow_multiple=False) returns a scalar; tolerate a
+            # list-like value anyway for robustness.
+            if isinstance(diff_tissue, (list, tuple)):
+                diff_tissue = diff_tissue[0] if diff_tissue else None
+            if diff_tissue in adata.obs[self.embryo.tissue_name].unique():
+                diff_adata = adata[adata.obs[self.embryo.tissue_name] == diff_tissue]
             else:
                 logging.warning(f"Tissue {diff_tissue} not found in adata.obs[{self.embryo.tissue_name}].")
                 return
-            diff_gene_avg = safe_toarray(diff_adata.X).mean(axis=0)
-            all_gene_avg = safe_toarray(adata.X).mean(axis=0)
+            diff_gene_avg = col_mean(diff_adata.X)
+            all_gene_avg = col_mean(adata.X)
             epsilon = 0.0001
             SES = np.log2((diff_gene_avg + epsilon) / (all_gene_avg + epsilon))
             SES_dict = {
@@ -853,22 +860,7 @@ class DisplayEmbryo():
             else:
                 gene_str = self.diff_exp_gene.value
             gene = gene_str.split(' (')[0]
-            gene_exp = safe_toarray(adata[:, gene].X)[:,0]
-            min_exp, max_exp = gene_exp.min(), gene_exp.max()
-            gene_exp_norm = (gene_exp - min_exp) / (max_exp - min_exp)
-            features = {}
-            features['gene_exp'] = gene_exp
-            viewer.add_points(
-                adata.obsm[self.embryo.coordinate_3d_key],
-                size=10,
-                face_color = cc.cm["CET_L4"](gene_exp_norm / 2),
-                features= features,
-                name=f'gene_{gene}',
-            )
-            self.cell_gene_color = {
-                i: color
-                for i, color in zip(list(range(len(gene_exp))), cc.cm["CET_L4"](gene_exp_norm / 2))
-            }
+            self._show_gene_expression(adata, gene)
         
         def show_diff_exp():
             self.diff_tissue = widgets.Select(
@@ -879,7 +871,7 @@ class DisplayEmbryo():
             )
             run_diff_exp = widgets.FunctionGui(
                 compute_diff_exp,
-                call_button="Show top 10 Differential Expression",
+                call_button="Show top 25 Differential Expression",
                 layout="vertical",
             )
             self.diff_exp_gene = widgets.Select(
@@ -930,7 +922,6 @@ class DisplayEmbryo():
         tab_2.addTab(self.one_gene_tab(), "1 Gene")
         tab_2.addTab(self.two_genes_tab(), "2 Genes")
         tab_2.addTab(self.three_genes_tab(), "3 Genes")
-        # tab_2.addTab(self.umap_tab(), "UMAP")
         tab_2.addTab(self.Moran_tab(), "Moran's I")
         tab_2.addTab(self.diff_exp_tab(), "Diff Exp")
         main_tab.addTab(tab_2, "Analysis")
@@ -951,11 +942,14 @@ class DisplayEmbryo():
         tissue_types = adata.obs[self.embryo.tissue_name].astype(str).values
         self.viewer.dims.ndisplay = 3
         position = adata.obsm[self.embryo.coordinate_3d_key]
+        if 'seu_3d_cells' in self.viewer.layers:
+            self.viewer.layers.remove('seu_3d_cells')
         self.viewer.add_points(
             position,
             size=10,
             face_color=[self.tissue_color_map[t] for t in tissue_types],
             features=adata.obs,
+            name='seu_3d_cells',
         )
 
     def __init__(self, viewer, embryo):
@@ -968,15 +962,7 @@ class DisplayEmbryo():
         """
         self.embryo = embryo
         self.viewer = viewer
+        # Embryo already guarantees obsm[coordinate_3d_key] is 3D.
         self.selected_adata = self.embryo.adata
-    
-        if self.selected_adata.obsm[self.embryo.coordinate_3d_key].shape[1] != 3 and 'z' in self.selected_adata.obs.columns:
-            self.selected_adata.obsm[self.embryo.coordinate_3d_key] = np.column_stack(
-                [
-                    self.selected_adata.obsm[self.embryo.coordinate_3d_key][:, 0],
-                    self.selected_adata.obsm[self.embryo.coordinate_3d_key][:, 1],
-                    self.selected_adata.obs['z'].values,
-                ]
-            )
         self.create_widget()
         self.display()

@@ -46,3 +46,10 @@ def error_points_selection(show=True):
     msg.setWindowTitle("Point cloud selection error")
     if show:
         msg.exec_()
+
+
+def col_mean(X):
+    """
+    Column-wise mean of a dense or sparse matrix, returned as a 1-D ndarray.
+    """
+    return np.asarray(X.mean(axis=0)).ravel()

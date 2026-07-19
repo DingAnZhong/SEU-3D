@@ -5,22 +5,39 @@ from magicgui import widgets
 from .display import DisplayEmbryo
 from pathlib import Path
 import anndata as ad
+from napari.qt.threading import thread_worker
+
+
+@thread_worker
+def _read_h5ad_worker(file_path):
+    """Read an h5ad file in a worker thread (keeps the GUI responsive)."""
+    return ad.read_h5ad(file_path)
+
 
 class ReadAdata(QWidget):
     """
     Widget to read anndata files and display their contents.
     """
     def show_components(self):
-        try:
-            file_path = Path(self.h5ad_file.value)
-            if not file_path.exists():
-                raise FileNotFoundError(f"文件不存在: {file_path}")
-            adata = ad.read_h5ad(file_path)
-            self.adata = adata
-        except Exception as e:
-            error_label = QLabel(f"错误: {str(e)}")
-            self.layout.addWidget(error_label)
+        file_path = Path(self.h5ad_file.value)
+        if not file_path.exists():
+            self.error_label.setText(f"错误: 文件不存在: {file_path}")
             return
+        self.error_label.setText("读取中，请稍候…")
+        self.load_button_1.setEnabled(False)
+        worker = _read_h5ad_worker(file_path)
+        worker.returned.connect(self._on_adata_loaded)
+        worker.errored.connect(self._on_adata_error)
+        worker.start()
+
+    def _on_adata_error(self, exc):
+        self.load_button_1.setEnabled(True)
+        self.error_label.setText(f"错误: {exc}")
+
+    def _on_adata_loaded(self, adata):
+        self.load_button_1.setEnabled(True)
+        self.error_label.setText("")
+        self.adata = adata
 
         if not hasattr(self, 'tab_widget'):
             self.tab_widget = QTabWidget()
@@ -33,7 +50,7 @@ class ReadAdata(QWidget):
         tab_info = QWidget()
         tab_info.setLayout(QVBoxLayout())
         adata_info = widgets.TextEdit(
-            value=adata,
+            value=str(adata),
             tooltip="Anndata object information",
         )
         tab_info.layout().addWidget(adata_info.native)
@@ -63,12 +80,16 @@ class ReadAdata(QWidget):
         """
         Load the embryo data and display it.
         """
-        self.embryo = Embryo(
-            data_path=self.h5ad_file.value,
-            tissue_name=self.tissue.value,
-            coordinate_3d_key=self.spatial_coord.value,
-            adata = self.adata,
-        )
+        try:
+            self.embryo = Embryo(
+                data_path=self.h5ad_file.value,
+                tissue_name=self.tissue.value,
+                coordinate_3d_key=self.spatial_coord.value,
+                adata=self.adata,
+            )
+        except Exception as e:
+            self.error_label.setText(f"错误: {e}")
+            return
         DisplayEmbryo(self.viewer, self.embryo)
 
     def __init__(self,napari_viewer):
@@ -77,9 +98,11 @@ class ReadAdata(QWidget):
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
 
-        self.h5ad_file = widgets.FileEdit(label="H5AD file")
+        self.h5ad_file = widgets.FileEdit(label="H5AD file", filter="*.h5ad")
         self.layout.addWidget(self.h5ad_file.native)
 
         self.load_button_1 = QPushButton("Read anndata then show components")
         self.load_button_1.clicked.connect(self.show_components)
         self.layout.addWidget(self.load_button_1)
+        self.error_label = QLabel("")
+        self.layout.addWidget(self.error_label)

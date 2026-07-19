@@ -10,12 +10,12 @@
 - **3D Visualization**: Render spatial transcriptomics data in 3D with napari
 - **Tissue Filtering**: Filter cells by tissue type, slice, germ layer, and XYZ range
 - **Gene Expression Analysis**: Single, dual, and triple gene expression coloring
-- **Similarity Search**: Find genes with similar expression patterns (cached)
+- **Similarity Search**: Find genes with similar expression patterns
 - **Moran's I Spatial Autocorrelation**: Compute spatial gene enrichment
 - **Differential Expression**: Identify tissue-specific marker genes
 - **Annotation**: Cluster and label cell populations in 3D space
 - **Surface Reconstruction**: Generate 3D surfaces for tissue regions (pyvista)
-- **Automatic Color Mapping**: Deterministic tissue colors with JSON override support
+- **Automatic Color Mapping**: Deterministic tissue colors from a discrete colormap
 
 ## Installation
 
@@ -27,14 +27,14 @@ Then open napari and look for "Load spatial transcriptomics data" in the plugins
 
 ## Environment
 
-Required dependencies are installed automatically via pip. For full functionality:
+All runtime dependencies are declared in `pyproject.toml` and installed automatically via pip:
+
+```bash
+pip install seu-3d              # core functionality
+pip install "seu-3d[surface]"   # + pyvista, for 3D surface reconstruction
+```
 
 - Python >= 3.9
-- napari >= 0.4.0
-- anndata >= 0.10
-- scanpy
-- squidpy
-- pyvista (optional, for surface generation)
 
 ## Quick Start
 
@@ -46,27 +46,30 @@ viewer = napari.Viewer()
 
 ## Update Log
 
-### [1.1.17] — 2026-05-30
-Full code optimization release:
+### [2.0.0] — 2026-07-19
+- **Packaging**:
+  - Declare runtime dependencies in `pyproject.toml` (previously `pip install seu-3d` pulled in nothing)
+  - Restrict `packages.find` to `seu_3d*` so stray directories are never published
+  - Remove the unused, broken `weiwei/` source tree and the dead `_umap_selection` module
+  - Single-source the version from `seu_3d.__version__`
 - **Bug Fixes**:
-  - Fix annotation float coordinate matching failure (replaced `np.isin` with `cKDTree` distance-based matching)
-  - Fix `threshold_3gene` widget variable name inconsistency
-  - Fix 2D→3D coordinate stacking producing view references (added `.copy()`)
-  - Fix missing `.raw` layer checks across multiple methods
-- **New Features**:
-  - `get_expression()` utility for safe gene expression retrieval (supports AnnData & Embryo objects)
-  - `require_active_points()` decorator for robust layer selection checking
-  - `_color_by_gene()` and `_normalize_gene_exp()` common methods to reduce code duplication
-  - `_similarity_cache` for cosine similarity results in gene similarity search
-  - `config.py` centralized constant management
-- **UX Improvements**:
-  - Improved colorbar display height and label visibility
-  - Automatic colormap fallback for tissues exceeding hardcoded color count (hash-deterministic)
-  - Structured AnnData info summary replacing verbose string output
-  - Progress status text updates for long-running operations
-- **Code Quality**:
-  - Cleaned up duplicate imports
-  - 52 unit tests covering all core functionality
+  - Fix slice filtering never applying (`obs['slice']` vs `obs['slices']` mismatch)
+  - Fix differential-expression tissue selection reading only the first character of the tissue name
+  - Fix annotation coordinate matching failing on floats (cKDTree nearest-neighbour matching) and guard empty selections
+  - Fix saving annotations before annotating raised `AttributeError`
+  - Fix NaN colors for genes with constant expression
+  - Deterministic tissue colors (removed random shuffle)
+  - Re-filtering and XY preview now reuse their napari layers instead of piling up new ones
+- **Performance**: remove redundant full `AnnData.copy()` in filtering and surface generation
+- Move h5ad reading, Moran's I, surface reconstruction and similar-gene search to worker threads (no more GUI freezing)
+- Sparse-aware cosine similarity and column means (no full-matrix densification)
+- **Code Quality**: remove duplicate/unused imports, unify gene-expression coloring into shared helpers
+- **Housekeeping**:
+  - Centralize 2D->3D coordinate stacking in `Embryo` (written back to `obsm`)
+  - Add MIT `LICENSE` and unit tests for `Embryo`
+
+### [1.1.17] — 2026-05-30
+- First public release as a napari manifest plugin: h5ad loading, tissue/slice/germ-layer/XY filtering, 1-3 gene expression coloring, similar-gene search, Moran's I, differential expression, annotation, pyvista surface reconstruction
 
 ### [1.1.6]
 First release with napari manifest support
@@ -89,3 +92,5 @@ First release
 - [napari-sc3D-viewer](https://github.com/GuignardLab/napari-sc3D-viewer)
 
 ## License
+
+Released under the [MIT License](LICENSE), like the upstream [sc3D](https://github.com/GuignardLab/sc3D) project it is derived from.
