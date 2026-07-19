@@ -68,7 +68,9 @@ def _similar_genes_worker(adata, gene):
     (sklearn handles sparse input without densifying the matrix).
     Returns the 10 most similar gene names, excluding `gene` itself.
     """
-    sim = cosine_similarity(adata.X.T, adata[:, gene].X).ravel()
+    # Query vector must be a (1, n_cells) row; X.T stays sparse.
+    query = safe_toarray(adata[:, gene].X).reshape(1, -1)
+    sim = cosine_similarity(adata.X.T, query).ravel()
     order = np.argsort(sim)[::-1]
     return [adata.var_names[i] for i in order if adata.var_names[i] != gene][:10]
 
