@@ -36,6 +36,24 @@ pip install "seu-3d[surface]"   # + pyvista, for 3D surface reconstruction
 
 - Python >= 3.9
 
+## Data Format
+
+The plugin reads `.h5ad` files. Two fields are **chosen in the widget** when
+loading; everything else is auto-detected by fixed names:
+
+| Field | Location | Required | Used for |
+|---|---|---|---|
+| *(your choice)* | `adata.obsm` key | Yes | Spatial coordinates. 3D `(x, y, z)` preferred; if 2D `(x, y)`, `obs['z']` is used as z |
+| *(your choice)* | `adata.obs` column | Yes | Tissue / cell-type labels (coloring, filtering, diff-expression) |
+| `z` | `adata.obs` | Only when the coordinate key is 2D | Z position of each cell |
+| `slices` | `adata.obs` | Optional | Slice/sample filter (falls back to `orig.ident`) |
+| `orig.ident` | `adata.obs` | Optional | Fallback slice/sample filter |
+| `germ_layer` | `adata.obs` | Optional | Germ-layer filter |
+| `x_flatten`, `y_flatten` | `adata.obs` | Optional | "Show Flatten" 2D projection |
+
+Missing optional fields simply disable the corresponding tab; the rest of the
+plugin keeps working.
+
 ## Quick Start
 
 ```python
@@ -60,9 +78,15 @@ viewer = napari.Viewer()
   - Fix NaN colors for genes with constant expression
   - Deterministic tissue colors (removed random shuffle)
   - Re-filtering and XY preview now reuse their napari layers instead of piling up new ones
-- **Performance**: remove redundant full `AnnData.copy()` in filtering and surface generation
-- Move h5ad reading, Moran's I, surface reconstruction and similar-gene search to worker threads (no more GUI freezing)
-- Sparse-aware cosine similarity and column means (no full-matrix densification)
+- **Performance**:
+  - Remove redundant full `AnnData.copy()` in filtering and surface generation; filtering now applies one combined mask (a single copy per click instead of four)
+  - Annotations accumulate in one persistent copy (no per-click dataset copy, and repeated annotations no longer reset earlier ones)
+  - Move h5ad reading, Moran's I, surface reconstruction and similar-gene search to worker threads (no more GUI freezing)
+  - Sparse-aware cosine similarity and column means (no full-matrix densification)
+- **UX**:
+  - Gene-expression views reuse a single `gene_expression` layer instead of stacking a new view per click
+  - Dock panel width is bounded and scrollable; AnnData info box is read-only and height-capped
+  - Documented the expected `obs`/`obsm` field names (see Data Format above)
 - **Code Quality**: remove duplicate/unused imports, unify gene-expression coloring into shared helpers
 - **Housekeeping**:
   - Centralize 2D->3D coordinate stacking in `Embryo` (written back to `obsm`)

@@ -180,29 +180,29 @@ class DisplayEmbryo():
         select_xy = [[self.show_x_min.value, self.show_x_max.value],
                     [self.show_y_min.value, self.show_y_max.value]]
         
-        filter_1 = adata[adata.obs[self.embryo.tissue_name].isin(selected_tissue)]
+        # Build one combined boolean mask so the AnnData subset (which
+        # copies) happens once, not once per filter step.
+        obs = adata.obs
+        mask = obs[self.embryo.tissue_name].isin(selected_tissue)
 
         # Keep in sync with slice_tab(): the selector is built from 'slices'
-        if 'slices' in adata.obs.columns:
-            filter_2 = filter_1[filter_1.obs['slices'].isin(selected_slice)]
-        elif 'orig.ident' in adata.obs.columns:
-            filter_2 = filter_1[filter_1.obs['orig.ident'].isin(selected_slice)]
-        else:
-            filter_2 = filter_1
+        if 'slices' in obs.columns:
+            mask &= obs['slices'].isin(selected_slice)
+        elif 'orig.ident' in obs.columns:
+            mask &= obs['orig.ident'].isin(selected_slice)
 
-        if 'germ_layer' in adata.obs.columns:
-            filter_3 = filter_2[filter_2.obs['germ_layer'].isin(selected_germ_layer)]
-        else:
-            filter_3 = filter_2
+        if 'germ_layer' in obs.columns:
+            mask &= obs['germ_layer'].isin(selected_germ_layer)
 
-        filter_4 = filter_3[
-            (filter_3.obsm[self.embryo.coordinate_3d_key][:, 0] >= select_xy[0][0]) &
-            (filter_3.obsm[self.embryo.coordinate_3d_key][:, 0] <= select_xy[0][1]) &
-            (filter_3.obsm[self.embryo.coordinate_3d_key][:, 1] >= select_xy[1][0]) &
-            (filter_3.obsm[self.embryo.coordinate_3d_key][:, 1] <= select_xy[1][1])
-        ]
+        coords = adata.obsm[self.embryo.coordinate_3d_key]
+        mask &= (
+            (coords[:, 0] >= select_xy[0][0])
+            & (coords[:, 0] <= select_xy[0][1])
+            & (coords[:, 1] >= select_xy[1][0])
+            & (coords[:, 1] <= select_xy[1][1])
+        )
 
-        self.selected_adata = filter_4
+        self.selected_adata = adata[mask]
 
         self.display()
         
@@ -472,7 +472,12 @@ class DisplayEmbryo():
                 np.asarray(points.data[selected_id], dtype=float)
             )
 
-            adata = self.embryo.adata.copy()
+            # Keep one persistent annotation copy: re-copying the whole
+            # dataset on every click is slow for large files, and starting
+            # from a fresh copy would discard previous annotations.
+            if not hasattr(self.embryo, 'adata_anno'):
+                self.embryo.adata_anno = self.embryo.adata.copy()
+            adata = self.embryo.adata_anno
             coords = np.asarray(
                 adata.obsm[self.embryo.coordinate_3d_key], dtype=float
             )
@@ -495,7 +500,6 @@ class DisplayEmbryo():
                 adata.obs[column_name.value] = adata.obs[column_name.value].cat.set_categories(new_cat)
             adata.obs.loc[mask, column_name.value] = cluster_anno.value
 
-            self.embryo.adata_anno = adata
             print(adata.obs[column_name.value].value_counts())
 
         def save_annotations():
