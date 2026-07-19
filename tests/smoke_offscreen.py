@@ -126,9 +126,14 @@ def main():
     ramp = DisplayEmbryo._normalize_exp(np.arange(10.0))
     check("normalization bounds", ramp.min() == 0.0 and ramp.max() == 1.0)
 
-    # ---- 7. _show_gene_expression ------------------------------------------
+    # ---- 7. _show_gene_expression (single reusable layer) ------------------
     disp._show_gene_expression(disp.selected_adata, "gene_2")
-    check("gene layer added", "gene_gene_2" in viewer.layers)
+    check("gene layer added", "gene_expression" in viewer.layers)
+    check("gene recorded in layer metadata",
+          viewer.layers["gene_expression"].metadata.get("gene") == "gene_2")
+    disp._show_gene_expression(disp.selected_adata, "gene_3")
+    n_gene_layers = sum(1 for l in viewer.layers if l.name == "gene_expression")
+    check("gene layer reused (no stacking)", n_gene_layers == 1)
     check("cell_gene_color cached", len(disp.cell_gene_color) == disp.selected_adata.n_obs)
 
     # ---- 8. show_flatten layer reuse ---------------------------------------

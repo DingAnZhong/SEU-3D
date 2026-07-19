@@ -2,7 +2,7 @@ import os
 os.environ["QT_ENABLE_GLYPH_CACHE_SHARING"] = "1"
 from qtpy import QtCore, QtWidgets
 QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_ShareOpenGLContexts)
-from qtpy.QtWidgets import QTabWidget, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QTabWidget, QVBoxLayout, QWidget, QScrollArea
 from magicgui import widgets
 from ._utils import error_points_selection, safe_toarray, col_mean
 from napari.qt.threading import thread_worker
@@ -101,19 +101,23 @@ class DisplayEmbryo():
 
     def _show_gene_expression(self, adata, gene):
         """
-        Add a points layer coloured by the expression of `gene`
-        and cache the per-cell colours for show_flatten().
+        Colour cells by the expression of `gene` in a single reusable
+        layer (no layer stacking) and cache the per-cell colours for
+        show_flatten().
         """
         gene_exp = safe_toarray(adata[:, gene].X)[:, 0]
         gene_exp_norm = self._normalize_exp(gene_exp)
         colors = cc.cm["CET_L4"](gene_exp_norm / 2)
-        self.viewer.add_points(
+        if 'gene_expression' in self.viewer.layers:
+            self.viewer.layers.remove('gene_expression')
+        layer = self.viewer.add_points(
             adata.obsm[self.embryo.coordinate_3d_key],
             size=10,
             face_color=colors,
             features={'gene_exp': gene_exp},
-            name=f'gene_{gene}',
+            name='gene_expression',
         )
+        layer.metadata['gene'] = gene
         self.cell_gene_color = {
             i: color for i, color in zip(range(len(gene_exp)), colors)
         }
@@ -632,13 +636,16 @@ class DisplayEmbryo():
             features = {}
             features[f'gene_exp_{gene_1}'] = gene_exp_1
             features[f'gene_exp_{gene_2}'] = gene_exp_2
-            viewer.add_points(
+            if 'two_genes_rgb' in viewer.layers:
+                viewer.layers.remove('two_genes_rgb')
+            layer = viewer.add_points(
                 self.selected_adata.obsm[self.embryo.coordinate_3d_key],
                 size=10,
                 face_color=colors,
                 features=features,
-                name=f'genes_{gene_1}_{gene_2}',
+                name='two_genes_rgb',
             )
+            layer.metadata['genes'] = (gene_1, gene_2)
             self.cell_gene_color = {
                 i: color
                 for i,color in zip(
@@ -707,13 +714,16 @@ class DisplayEmbryo():
             features[f'gene_exp_{gene_1}'] = gene_exp_1
             features[f'gene_exp_{gene_2}'] = gene_exp_2
             features[f'gene_exp_{gene_3}'] = gene_exp_3
-            viewer.add_points(
+            if 'three_genes_rgb' in viewer.layers:
+                viewer.layers.remove('three_genes_rgb')
+            layer = viewer.add_points(
                 adata.obsm[self.embryo.coordinate_3d_key],
                 size=10,
                 face_color=colors,
                 features=features,
-                name=f'genes_{gene_1}_{gene_2}_{gene_3}',
+                name='three_genes_rgb',
             )
+            layer.metadata['genes'] = (gene_1, gene_2, gene_3)
             self.cell_gene_color = {
                 i: color
                 for i, color in zip(
@@ -808,7 +818,7 @@ class DisplayEmbryo():
             )
             run_show_moran = widgets.FunctionGui(
                 plot_moran,
-                call_button="Show top 10 gene exp",
+                call_button="Show selected gene exp",
                 layout="vertical",
             )
             moran_container = widgets.Container(
@@ -883,7 +893,7 @@ class DisplayEmbryo():
             )
             run_show_diff_exp = widgets.FunctionGui(
                 plot_diff_exp,
-                call_button="Show top 10 gene exp",
+                call_button="Show selected gene exp",
                 layout="vertical",
             )
             diff_exp_container = widgets.Container(
@@ -931,7 +941,14 @@ class DisplayEmbryo():
         # tab_3 = QTabWidget()
         # main_tab.addTab(tab_3, "Scanpy plots")
 
-        layout.addWidget(main_tab)
+        # Wrap the tabs in a scroll area and bound the dock width so the
+        # panel stays resizable instead of forcing a huge minimum width.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(main_tab)
+        layout.addWidget(scroll)
+        container.setMinimumWidth(320)
+        container.setMaximumWidth(520)
         self.viewer.window.add_dock_widget(
             container, name="Embryo Display", area="right"
         )

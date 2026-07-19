@@ -53,6 +53,8 @@ class ReadAdata(QWidget):
             value=str(adata),
             tooltip="Anndata object information",
         )
+        adata_info.native.setReadOnly(True)
+        adata_info.native.setMaximumHeight(180)
         tab_info.layout().addWidget(adata_info.native)
         self.tab_widget.addTab(tab_info, "Anndata Info")
 
@@ -95,6 +97,9 @@ class ReadAdata(QWidget):
     def __init__(self,napari_viewer):
         super().__init__()
         self.viewer = napari_viewer
+        # Keep the dock width within a controllable range.
+        self.setMinimumWidth(280)
+        self.setMaximumWidth(480)
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
 
